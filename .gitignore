@@ -3,3 +3,4 @@ model.h5
 model.json
 *.sh
 *.pdf
+debug_*.py
