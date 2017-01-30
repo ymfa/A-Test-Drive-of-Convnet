@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 from keras.models import Sequential
 from keras.layers.core import Dense, Activation, Flatten, Dropout, Lambda
 from keras.layers.convolutional import Convolution2D
+from keras.layers.pooling import MaxPooling2D
 from keras.layers.advanced_activations import ELU
 from scipy.ndimage.filters import gaussian_filter1d
 
@@ -18,10 +19,7 @@ outdims = ('YUV',)
 
 def activation_func():
   return ELU()
-  
-def img_normalization(img):
-  return img / tf.reduce_mean(img, axis=(0, 1)) - 1.
-  
+
 def nvidia_model():
   model = Sequential()
   model.add(Lambda(lambda x: x/127.5 - 1., input_shape=img_shape))
@@ -46,25 +44,30 @@ def nvidia_model():
 
 def my_model():
   model = Sequential()
+  # Normalization
   model.add(Lambda(lambda x: x/127.5 - 1., input_shape=img_shape))
+  # Convolution 1
   model.add(Convolution2D(24, 5, 5, subsample=(2, 2), border_mode='valid'))
-  model.add(Dropout(0.2))
   model.add(activation_func())
+  model.add(MaxPooling2D(pool_size=(2, 2)))
+  model.add(Dropout(0.2))
+  # Convolution 2
   model.add(Convolution2D(36, 5, 5, subsample=(2, 2), border_mode='valid'))
   model.add(Dropout(0.2))
   model.add(activation_func())
-  model.add(Convolution2D(48, 5, 5, subsample=(2, 2), border_mode='valid'))
-  model.add(Dropout(0.2))
-  model.add(activation_func())
-  model.add(Convolution2D(64, 2, 2, border_mode='valid'))
+  # Convolution 3
+  model.add(Convolution2D(48, 2, 2, border_mode='valid'))
   model.add(Dropout(0.2))
   model.add(Flatten())
   model.add(activation_func())
-  model.add(Dense(200))
+  # Dense 1
+  model.add(Dense(100))
   model.add(Dropout(0.5))
   model.add(activation_func())
-  model.add(Dense(20))
+  # Dense 2
+  model.add(Dense(10))
   model.add(activation_func())
+  # Output
   model.add(Dense(1))
   model.compile("adam", "mse")
   return model
@@ -105,27 +108,40 @@ def process_img(img, indim, flip=False, luma_alt=False):
     return layers[0]
   else:
     return np.concatenate(layers, 2)
-    
-def filter_zero_steering(x, y, drop_prob):
-  indices_to_remove = np.where(y == 0.)[0]
-  np.random.shuffle(indices_to_remove)
-  indices_to_remove = indices_to_remove[:np.rint(len(indices_to_remove) * drop_prob)]
-  mask = np.ones(len(y), dtype=bool)
-  mask[indices_to_remove] = False
-  return np.array(x)[mask], y[mask]
 
 def img_generator(x_data, y_data, training=True):
-  batch_size = args.batch
+  batch_size, total_size = args.batch, len(y_data)
+  indices = np.array(range(total_size))
+  if training:
+    sample_weights = np.array([dataset.weight for _, dataset in x_data], dtype='float32')
+    for i, steering in enumerate(y_data):
+      if steering == 0. and x_data[i][1].zero_prob < 1.:
+        sample_weights[i] *= x_data[i][1].zero_prob
+  else:
+    sample_weights = np.array([dataset.dataset_weight for _, dataset in x_data], dtype='float32')
+  sample_weights /= np.sum(sample_weights)
   while True:
-    x_epoch, y_epoch = filter_zero_steering(x_data, y_data, 0.8)
-    if training:
-      x_epoch, y_epoch = shuffle(x_epoch, y_epoch)
-    for offset in range(0, len(y_epoch), batch_size):
-      batch_paths, batch_y = x_data[offset:offset+batch_size], y_data[offset:offset+batch_size]
-      batch_x = np.zeros((len(batch_paths), img_shape[0], img_shape[1], img_shape[2]), dtype='float32')
-      for i, (imgpath, flip) in enumerate(batch_paths):
-        batch_x[i] = process_img(cv2.imread(imgpath), 'BGR', flip, training)
-      yield batch_x, batch_y
+    batch_indices = np.random.choice(indices, batch_size, p=sample_weights)
+    batch_info = [x_data[i] for i in batch_indices]
+    batch_y = np.array([y_data[i] for i in batch_indices], dtype='float32')
+    batch_x = np.zeros((batch_size, img_shape[0], img_shape[1], img_shape[2]), dtype='float32')
+    for i in range(batch_size):
+      filename, dataset = batch_info[i]
+      flip, variant = False, 'center'
+      if training:
+        variant = np.random.choice(dataset.variations)
+        if variant.startswith('-'):
+          flip, variant = True, variant[1:]
+        if variant == 'left':
+          batch_y[i] = min(batch_y[i] + .15, 1.)
+        elif variant == 'right':
+          batch_y[i] = max(batch_y[i] - .15, -1.)
+      if flip:
+        batch_y[i] = -batch_y[i]
+      imgpath = join(dataset.path, "IMG", variant + filename)
+      iamge = process_img(cv2.imread(imgpath), 'BGR', flip, training)
+      batch_x[i] = iamge
+    yield batch_x, batch_y
 
 def extend_data(x_old, x_new, y_old, y_new, shift=0):
   if not y_new: return x_old, y_old
@@ -140,13 +156,16 @@ def extend_data(x_old, x_new, y_old, y_new, shift=0):
     return x_old + x_new, np.concatenate((y_old, y_new))
 
 class Dataset(object):
-  def __init__(self, path, columns=(0,), flips=(False,), time_shift=0):
+  def __init__(self, path, variations=('center',), weight=1., frame_shift=0, zero_prob=1.):
     self.path = path
-    self.columns = columns
-    self.flips = flips
-    self.frame_shift = time_shift * (len(columns) + sum(flips))
+    self.variations = variations
+    self.frame_shift = frame_shift
+    self.dataset_weight = weight
+    self.weight = weight * len(variations)
+    self.zero_prob = zero_prob
 
-udacity_data = Dataset('data', (0,1,2), (True,False,False), 1)
+udacity_data = Dataset('data', ('center', '-center', 'left', 'right'), frame_shift=1, zero_prob=0.2)
+other_data = Dataset('session_data', ('center', '-center', 'left', 'right'), weight=.5, frame_shift=1, zero_prob=0.05)
 
 def load_data(dataset_list):
   x_train, y_train = [], None
@@ -160,7 +179,7 @@ def load_data(dataset_list):
         try: steering = float(row[3])
         except ValueError: continue
         # if there is a gap in the recording, treat the previous part as a seperate dataset
-        filename = row[0].strip()
+        filename = row[0].strip()[10:]
         current_time = datetime(*[int(v) for v in ts_recognizer.search(filename).groups()])
         if previous_time is not None:
           time_delta = current_time - previous_time
@@ -170,36 +189,32 @@ def load_data(dataset_list):
             print("Time gap in training data:", time_delta)
         previous_time = current_time
         # append to x, y
-        for column, flip in zip(dataset.columns, dataset.flips):
-          filename = row[column].strip()
-          if column == 0: adj_steering = steering
-          elif column == 1: adj_steering = min(steering + .15, 1.)
-          elif column == 2: adj_steering = max(steering - .15, -1.)
-          else: raise ValueError('Image must be in column 0, 1, or 2')
-          x_dataset.append((join(dataset.path, filename), False))
-          y_dataset.append(adj_steering)
-          if flip:
-            x_dataset.append((join(dataset.path, filename), True))
-            y_dataset.append(-adj_steering)
+        x_dataset.append((filename, dataset))
+        y_dataset.append(steering)
     # submit to the pool of training data
     x_train, y_train = extend_data(x_train, x_dataset, y_train, y_dataset, dataset.frame_shift)
-  x_train, x_valid, y_train, y_valid = train_test_split(x_train, y_train, test_size=0.1, random_state=42)
+  # validation set
+  x_train, x_valid, y_train, y_valid = train_test_split(x_train, y_train, test_size=0.05, random_state=42)
+  print('Training set:', len(y_train), 'frames')
+  print('Validation set:', len(y_valid), 'frames')
   return img_generator(x_train, y_train), img_generator(x_valid, y_valid, False)
 
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(description='Train a behavioural cloning model')
   parser.add_argument('--batch', type=int, default=256, help='Batch size')
+  parser.add_argument('--train', type=int, default=64, help='Number of training batches per epoch')
+  parser.add_argument('--valid', type=int, default=2, help='Number of validation batches per epoch')
   parser.add_argument('--epoch', type=int, default=10, help='Number of epochs')
   args = parser.parse_args()
   
   model = my_model()
-  gen_train1, gen_valid1 = load_data([udacity_data])
+  gen_train1, gen_valid1 = load_data([udacity_data, other_data])
   
   print("Training...")
   model.fit_generator(
-      gen_train1, args.batch * 64, args.epoch,
-      validation_data=gen_valid1, nb_val_samples=args.batch * 8
+      gen_train1, args.batch * args.train, args.epoch,
+      validation_data=gen_valid1, nb_val_samples=args.batch * args.valid
   )
 
   print("Saving model...")
