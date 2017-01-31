@@ -72,8 +72,11 @@ def my_model():
   model.compile("adam", "mse")
   return model
 
-def process_img(img, indim, flip=False, luma_alt=False):
+def process_img(img, indim, flip=False, luma_alt=False, translation=0.):
   img = img[59:135]
+  if translation != 0.:
+    translation_matrix = np.float32([[1, 0, translation], [0, 1, 0]])
+    img = cv2.warpAffine(img, translation_matrix, img.shape[:2])
   if 'edge' in outdims:
     if indim == 'RGB': s_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     elif indim == 'BGR': s_img = img
@@ -90,7 +93,7 @@ def process_img(img, indim, flip=False, luma_alt=False):
     else: raise NotImplementedError('Cannot convert %s into YUV' % indim)
     if luma_alt:
       max_luma_ratio = min(1.25, 255. / np.max(img_yuv[:,:,0]))
-      luma_ratio = np.random.uniform(.75, max_luma_ratio)
+      luma_ratio = np.random.uniform(.5, max_luma_ratio)
       img_yuv[:,:,0] *= luma_ratio
   layers = []
   for dim in outdims:
@@ -115,8 +118,8 @@ def img_generator(x_data, y_data, training=True):
   if training:
     sample_weights = np.array([dataset.weight for _, dataset in x_data], dtype='float32')
     for i, steering in enumerate(y_data):
-      if steering == 0. and x_data[i][1].zero_prob < 1.:
-        sample_weights[i] *= x_data[i][1].zero_prob
+      if abs(steering) <= x_data[i][1].straight_th and x_data[i][1].straight_prob < 1.:
+        sample_weights[i] *= x_data[i][1].straight_prob
   else:
     sample_weights = np.array([dataset.dataset_weight for _, dataset in x_data], dtype='float32')
   sample_weights /= np.sum(sample_weights)
@@ -127,11 +130,21 @@ def img_generator(x_data, y_data, training=True):
     batch_x = np.zeros((batch_size, img_shape[0], img_shape[1], img_shape[2]), dtype='float32')
     for i in range(batch_size):
       filename, dataset = batch_info[i]
-      flip, variant = False, 'center'
+      flip, translation, variant = False, 0., 'center'
       if training:
         variant = np.random.choice(dataset.variations)
-        if variant.startswith('-'):
-          flip, variant = True, variant[1:]
+        if variant.startswith('+'):
+          translation, variant = np.random.uniform(-20, 20), variant[1:]
+          batch_y[i] += .001 * (1+abs(batch_y[i])*5) * translation
+          if batch_y[i] > 1.: batch_y[i] = 1.
+          elif batch_y[i] < -1.: batch_y[i] = -1.
+        elif variant.startswith('-'):
+          if batch_y[i] <= 0.4 or np.random.randint(3) != 2:
+            flip = True  # decrease p(flip) for big right turns
+          variant = variant[1:]
+        elif variant == 'center':
+          if batch_y[i] < -0.4 and np.random.randint(3) == 2:
+            flip = True  # increase p(flip) for big left turns
         if variant == 'left':
           batch_y[i] = min(batch_y[i] + .15, 1.)
         elif variant == 'right':
@@ -139,8 +152,8 @@ def img_generator(x_data, y_data, training=True):
       if flip:
         batch_y[i] = -batch_y[i]
       imgpath = join(dataset.path, "IMG", variant + filename)
-      iamge = process_img(cv2.imread(imgpath), 'BGR', flip, training)
-      batch_x[i] = iamge
+      image = process_img(cv2.imread(imgpath), 'BGR', flip, training, translation)
+      batch_x[i] = image
     yield batch_x, batch_y
 
 def extend_data(x_old, x_new, y_old, y_new, shift=0):
@@ -156,16 +169,18 @@ def extend_data(x_old, x_new, y_old, y_new, shift=0):
     return x_old + x_new, np.concatenate((y_old, y_new))
 
 class Dataset(object):
-  def __init__(self, path, variations=('center',), weight=1., frame_shift=0, zero_prob=1.):
+  def __init__(self, path, variations=('center',), weight=1., frame_shift=0, straight_prob=1., straight_th=0.):
     self.path = path
     self.variations = variations
     self.frame_shift = frame_shift
     self.dataset_weight = weight
     self.weight = weight * len(variations)
-    self.zero_prob = zero_prob
+    self.straight_prob = straight_prob
+    self.straight_th = straight_th
 
-udacity_data = Dataset('data', ('center', '-center', 'left', 'right'), frame_shift=1, zero_prob=0.2)
-other_data = Dataset('session_data', ('center', '-center', 'left', 'right'), weight=.5, frame_shift=1, zero_prob=0.05)
+udacity_data = Dataset('data', ('center', '-center', '+center', 'left', 'right'), frame_shift=1, straight_prob=0.2)
+other_data = Dataset('session_data', ('center', '-center', 'left', 'right'), weight=.5, frame_shift=1, straight_prob=0.05)
+refine_data = Dataset('data', ('center',), frame_shift=1, straight_prob=0.05, straight_th=0.4)
 
 def load_data(dataset_list):
   x_train, y_train = [], None
@@ -206,10 +221,17 @@ if __name__ == "__main__":
   parser.add_argument('--train', type=int, default=64, help='Number of training batches per epoch')
   parser.add_argument('--valid', type=int, default=2, help='Number of validation batches per epoch')
   parser.add_argument('--epoch', type=int, default=10, help='Number of epochs')
+  parser.add_argument('--refine', action='store_true', help='Use this to refine a trained model')
   args = parser.parse_args()
   
   model = my_model()
-  gen_train1, gen_valid1 = load_data([udacity_data, other_data])
+  if args.refine:
+    gen_train1, gen_valid1 = load_data([refine_data])
+    model.load_weights('model.h5')
+    output_name = 'improved'
+  else:
+    gen_train1, gen_valid1 = load_data([udacity_data, other_data])
+    output_name = 'model'
   
   print("Training...")
   model.fit_generator(
@@ -218,6 +240,6 @@ if __name__ == "__main__":
   )
 
   print("Saving model...")
-  model.save_weights("./model.h5")
-  with open('./model.json', 'w') as outfile:
+  model.save_weights(output_name + ".h5")
+  with open(output_name + '.json', 'w') as outfile:
     outfile.write(model.to_json())
