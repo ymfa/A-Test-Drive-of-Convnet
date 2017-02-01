@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import tensorflow as tf
 import csv, argparse, re
 from os.path import join
 from datetime import datetime
@@ -13,7 +12,10 @@ from keras.layers.pooling import MaxPooling2D
 from keras.layers.advanced_activations import ELU
 from scipy.ndimage.filters import gaussian_filter1d
 
-#img_shape = (66, 200, 3)
+# Fix error with Keras and TensorFlow
+import tensorflow as tf
+tf.python.control_flow_ops = tf
+
 img_shape = (38, 160, 3)
 outdims = ('YUV',)
 
@@ -21,6 +23,8 @@ def activation_func():
   return ELU()
 
 def nvidia_model():
+  global img_shape
+  img_shape = (66, 200, 3)
   model = Sequential()
   model.add(Lambda(lambda x: x/127.5 - 1., input_shape=img_shape))
   model.add(Convolution2D(24, 5, 5, subsample=(2, 2), border_mode='valid'))
@@ -72,29 +76,55 @@ def my_model():
   model.compile("adam", "mse")
   return model
 
-def process_img(img, indim, flip=False, luma_alt=False, translation=0.):
-  img = img[59:135]
-  if translation != 0.:
-    translation_matrix = np.float32([[1, 0, translation], [0, 1, 0]])
-    img = cv2.warpAffine(img, translation_matrix, img.shape[:2])
-  if 'edge' in outdims:
-    if indim == 'RGB': s_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    elif indim == 'BGR': s_img = img
-    else: raise NotImplementedError('Cannot convert %s into BGR' % indim)
-    img_edge = np.reshape(cv2.Canny(cv2.GaussianBlur(s_img, (5, 5), 0), 50, 150), (img_shape[0], img_shape[1], 1)).astype('float32')
+def process_img(img, indim, flip=False, augmentation=False, translation=0.):
+  # warning: range after cropping [59, 135) are hard-coded for the image size
   img = img.astype('float32')
+  # rotating and horizontal shift
+  affine_matrix, transform = None, None
+  if translation != 0.:
+    affine_matrix = np.float32([[1, 0, translation], [0, 1, 0]])
+  if augmentation:
+    rotation_degree = np.random.normal(scale=1.)
+    if rotation_degree >= .1 or rotation_degree <= -.1:  # save computation
+      rotation_matrix = cv2.getRotationMatrix2D((img.shape[1]/2, (135+59)/2), rotation_degree, 1.)
+      if affine_matrix is not None:  # prefer one perspective transform over consecutive affine transforms to minimize cropping
+        affine_matrix = np.concatenate((affine_matrix, [[0., 0., 1.]]))  # 2x3 => 3x3 matrix
+        rotation_matrix = np.concatenate((rotation_matrix, [[0., 0., 1.]]))  # 2x3 => 3x3 matrix
+        transform = np.dot(affine_matrix, rotation_matrix)  # rotation will be performed before translation
+      else:
+        affine_matrix = rotation_matrix
+  if transform is not None:
+    img = cv2.warpPerspective(img, transform, (img.shape[1], img.shape[0]))
+  elif affine_matrix is not None:
+    img = cv2.warpAffine(img, affine_matrix, (img.shape[1], img.shape[0]))
+  # vertical shift, implemented as cropping
+  vertical_shift = 0
+  if augmentation:
+    vertical_shift = np.rint(np.random.normal(scale=0.8)).astype(int)
+    if vertical_shift > 4: vertical_shift = 4
+    elif vertical_shift < -4:  vertical_shift = -4
+  img = img[59+vertical_shift:135+vertical_shift]
+  # flipping and resizing
   if flip:
     img = cv2.flip(img, 1)
   if img.shape[:2] != img_shape[:2]:
     img = cv2.resize(img, (img_shape[1], img_shape[0]), cv2.INTER_AREA)
+  # edge detection
+  if 'edge' in outdims:
+    if indim == 'RGB': s_img = np.rint(cv2.cvtColor(img, cv2.COLOR_RGB2BGR)).astype('uint8')
+    elif indim == 'BGR': s_img = img.astype('uint8')
+    else: raise NotImplementedError('Cannot convert %s into BGR' % indim)
+    img_edge = np.reshape(cv2.Canny(cv2.GaussianBlur(s_img, (5, 5), 0), 50, 150), (img_shape[0], img_shape[1], 1)).astype('float32')
+  # YUV colour space and random brightness
   if 'YUV' in outdims:
     if indim == 'BGR': img_yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
     elif indim == 'RGB': img_yuv = cv2.cvtColor(img, cv2.COLOR_RGB2YUV)
     else: raise NotImplementedError('Cannot convert %s into YUV' % indim)
-    if luma_alt:
+    if augmentation:  # warning: brightness of RGB dimensions are not affected
       max_luma_ratio = min(1.25, 255. / np.max(img_yuv[:,:,0]))
       luma_ratio = np.random.uniform(.5, max_luma_ratio)
       img_yuv[:,:,0] *= luma_ratio
+  # compose colour channels
   layers = []
   for dim in outdims:
     if dim == 'RGB':
@@ -135,7 +165,7 @@ def img_generator(x_data, y_data, training=True):
         variant = np.random.choice(dataset.variations)
         if variant.startswith('+'):
           translation, variant = np.random.uniform(-20, 20), variant[1:]
-          batch_y[i] += .001 * (1+abs(batch_y[i])*5) * translation
+          batch_y[i] += .005 * translation
           if batch_y[i] > 1.: batch_y[i] = 1.
           elif batch_y[i] < -1.: batch_y[i] = -1.
         elif variant.startswith('-'):
