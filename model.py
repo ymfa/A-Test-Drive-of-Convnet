@@ -3,6 +3,7 @@ import numpy as np
 import csv, argparse, re
 from os.path import join
 from datetime import datetime
+from collections import Counter
 from sklearn.utils import shuffle
 from sklearn.model_selection import train_test_split
 from keras.models import Sequential
@@ -142,49 +143,74 @@ def process_img(img, indim, flip=False, augmentation=False, translation=0.):
   else:
     return np.concatenate(layers, 2)
 
+def grade_steering(steering):
+  if steering > 0.:
+    if steering > 0.4: return 3
+    elif steering > 0.2: return 2
+    else: return 1
+  elif steering < 0.:
+    if steering < -0.4: return -3
+    elif steering < -0.2: return -2
+    else: return -1
+  else: return 0
+
 def img_generator(x_data, y_data, training=True):
   batch_size, total_size = args.batch, len(y_data)
   indices = np.array(range(total_size))
+  batch_id = 0
+  dw_exp, final_dw_exp, dw_exp_factor = 2., 0.75, 1.
+  lr_prob, max_lr_prob, lr_prob_incr = 0., .5, 0.
+  tr_prob, max_tr_prob, tr_prob_incr = 0., .5, 0.
+  if training and args.epoch > 1:
+    lr_prob_incr = (max_lr_prob - lr_prob) / (args.epoch - 1)
+    tr_prob_incr = (max_tr_prob - tr_prob) / (args.epoch - 1)
+    dw_exp_factor = (final_dw_exp / dw_exp) ** (1 / (args.epoch - 1))
   if training:
-    sample_weights = np.array([dataset.weight for _, dataset in x_data], dtype='float32')
-    for i, steering in enumerate(y_data):
-      if abs(steering) <= x_data[i][1].straight_th and x_data[i][1].straight_prob < 1.:
-        sample_weights[i] *= x_data[i][1].straight_prob
+    sample_weights = np.float32([dataset.train_weight * (dataset.prob[grade_steering(y_data[i])] ** dw_exp)
+                               for i, (_, dataset) in enumerate(x_data)])
   else:
-    sample_weights = np.array([dataset.dataset_weight for _, dataset in x_data], dtype='float32')
+    sample_weights = np.float32([dataset.test_weight for _, dataset in x_data])
   sample_weights /= np.sum(sample_weights)
   while True:
     batch_indices = np.random.choice(indices, batch_size, p=sample_weights)
     batch_info = [x_data[i] for i in batch_indices]
-    batch_y = np.array([y_data[i] for i in batch_indices], dtype='float32')
+    batch_y = np.float32([y_data[i] for i in batch_indices])
     batch_x = np.zeros((batch_size, img_shape[0], img_shape[1], img_shape[2]), dtype='float32')
     for i in range(batch_size):
       filename, dataset = batch_info[i]
       flip, translation, variant = False, 0., 'center'
       if training:
-        variant = np.random.choice(dataset.variations)
-        if variant.startswith('+'):
-          translation, variant = np.random.uniform(-20, 20), variant[1:]
+        # use left/right cameras
+        if dataset.side_cameras and lr_prob > 0. and np.random.rand() < lr_prob:
+          dice = np.random.randint(2)
+          if dice == 0:
+            variant, batch_y[i] = 'left', min(batch_y[i] + .15, 1.)
+          else:
+            variant, batch_y[i] = 'right', max(batch_y[i] - .15, -1.)
+        # horizontal translation
+        if tr_prob == 1. or (tr_prob > 0. and np.random.rand() < tr_prob):
+          translation = np.random.uniform(-20, 20)
           batch_y[i] += .005 * translation
           if batch_y[i] > 1.: batch_y[i] = 1.
           elif batch_y[i] < -1.: batch_y[i] = -1.
-        elif variant.startswith('-'):
-          if batch_y[i] <= 0.4 or np.random.randint(3) != 2:
-            flip = True  # decrease p(flip) for big right turns
-          variant = variant[1:]
-        elif variant == 'center':
-          if batch_y[i] < -0.4 and np.random.randint(3) == 2:
-            flip = True  # increase p(flip) for big left turns
-        if variant == 'left':
-          batch_y[i] = min(batch_y[i] + .15, 1.)
-        elif variant == 'right':
-          batch_y[i] = max(batch_y[i] - .15, -1.)
-      if flip:
-        batch_y[i] = -batch_y[i]
+        # flipping
+        if np.random.randint(2) == 1:
+          flip, batch_y[i] = True, -batch_y[i]
       imgpath = join(dataset.path, "IMG", variant + filename)
       image = process_img(cv2.imread(imgpath), 'BGR', flip, training, translation)
       batch_x[i] = image
     yield batch_x, batch_y
+    # adjust probability of the training samples
+    batch_id += 1
+    if training and batch_id == args.train:
+      batch_id = 0
+      lr_prob += lr_prob_incr
+      tr_prob += tr_prob_incr
+      if dw_exp_factor != 1.:
+        dw_exp *= dw_exp_factor
+        sample_weights = np.float32([dataset.train_weight * (dataset.prob[grade_steering(y_data[i])] ** dw_exp)
+                                     for i, (_, dataset) in enumerate(x_data)])
+        sample_weights /= np.sum(sample_weights)
 
 def extend_data(x_old, x_new, y_old, y_new, shift=0):
   if not y_new: return x_old, y_old
@@ -199,21 +225,21 @@ def extend_data(x_old, x_new, y_old, y_new, shift=0):
     return x_old + x_new, np.concatenate((y_old, y_new))
 
 class Dataset(object):
-  def __init__(self, path, variations=('center',), weight=1., frame_shift=0, straight_prob=1., straight_th=0.):
+  def __init__(self, path, side_cameras=False, weight=1., frame_shift=0):
     self.path = path
-    self.variations = variations
+    self.side_cameras = side_cameras
     self.frame_shift = frame_shift
-    self.dataset_weight = weight
-    self.weight = weight * len(variations)
-    self.straight_prob = straight_prob
-    self.straight_th = straight_th
+    self.test_weight = weight
+    if side_cameras:
+      self.train_weight = weight * 2.
+    else:
+      self.train_weight = weight
 
-udacity_data = Dataset('data', ('center', '-center', '+center', 'left', 'right'), frame_shift=1, straight_prob=0.2)
-other_data = Dataset('session_data', ('center', '-center', 'left', 'right'), weight=.5, frame_shift=1, straight_prob=0.05)
-refine_data = Dataset('data', ('center',), frame_shift=1, straight_prob=0.05, straight_th=0.4)
+udacity_data = Dataset('data', True, weight=2., frame_shift=1)
+my_data = Dataset('my_track1', False, frame_shift=1)
 
 def load_data(dataset_list):
-  x_train, y_train = [], None
+  x_train, y_train, y_count = [], None, Counter()
   ts_recognizer = re.compile(r'(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})', re.ASCII)
   for dataset in dataset_list:
     x_dataset, y_dataset = [], []
@@ -233,11 +259,16 @@ def load_data(dataset_list):
             x_dataset, y_dataset = [], []
             print("Time gap in training data:", time_delta)
         previous_time = current_time
-        # append to x, y
+        # append to x, y, and the counter
         x_dataset.append((filename, dataset))
         y_dataset.append(steering)
+        y_count[grade_steering(steering)] += 1
     # submit to the pool of training data
     x_train, y_train = extend_data(x_train, x_dataset, y_train, y_dataset, dataset.frame_shift)
+    # balance the steering angles in this dataset
+    max_count = max(y_count.values())
+    dataset.prob = {k: max_count/v for k, v in y_count.items()}
+    y_count = Counter()
   # validation set
   x_train, x_valid, y_train, y_valid = train_test_split(x_train, y_train, test_size=0.05, random_state=42)
   print('Training set:', len(y_train), 'frames')
@@ -250,17 +281,17 @@ if __name__ == "__main__":
   parser.add_argument('--batch', type=int, default=256, help='Batch size')
   parser.add_argument('--train', type=int, default=64, help='Number of training batches per epoch')
   parser.add_argument('--valid', type=int, default=2, help='Number of validation batches per epoch')
-  parser.add_argument('--epoch', type=int, default=10, help='Number of epochs')
+  parser.add_argument('--epoch', type=int, default=20, help='Number of epochs')
   parser.add_argument('--refine', action='store_true', help='Use this to refine a trained model')
   args = parser.parse_args()
   
   model = my_model()
-  if args.refine:
+  if args.refine:  # argument 'initial_epoch' not usable in fit_generator due to Keras version
     gen_train1, gen_valid1 = load_data([refine_data])
     model.load_weights('model.h5')
     output_name = 'improved'
   else:
-    gen_train1, gen_valid1 = load_data([udacity_data, other_data])
+    gen_train1, gen_valid1 = load_data([udacity_data, my_data])
     output_name = 'model'
   
   print("Training...")
